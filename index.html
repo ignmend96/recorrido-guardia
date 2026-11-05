@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="es-AR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1519">
+<title>Recorrido del guardia</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icono-192.png">
+<style>
+:root{--bg:#0f1519;--surface:#172027;--fg:#e4eaed;--muted:#93a1aa;--line:#2b3740;
+  --accent:#4fb3bf;--accent-fg:#06262a;--ok:#5fcf86;--ok-soft:#173726;--warn:#e9a94a;--warn-soft:#3a2b12;
+  --bad:#f07a70;--bad-soft:#3d1c19;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font:18px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;
+  -webkit-tap-highlight-color:transparent}
+main{max-width:520px;margin:0 auto;padding:18px 16px 28px;min-height:100%;display:flex;flex-direction:column;gap:14px}
+h1{font-size:30px;line-height:1.1;margin:0}
+h2{font-size:20px;margin:6px 0 0}
+p{margin:0}
+.apagado{color:var(--muted);font-size:16px}
+.aviso{border-radius:12px;padding:14px 16px;background:var(--surface);border:1px solid var(--line)}
+.aviso.ok{background:var(--ok-soft);border-color:var(--ok)}
+.aviso.atras{background:var(--bad-soft);border-color:var(--bad)}
+.aviso strong{display:block;font-size:22px}
+ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.punto{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:15px 14px;font-size:21px;
+  background:var(--surface);border:1px solid var(--line);border-radius:12px}
+.punto.hecho{background:var(--ok-soft);border-color:var(--ok)}
+.punto span:last-child{white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--muted);font-size:17px}
+.punto.hecho span:last-child{color:var(--ok);font-weight:600}
+button{font:inherit;font-weight:600;border:0;border-radius:12px;padding:15px 16px;width:100%;
+  background:var(--accent);color:var(--accent-fg);cursor:pointer}
+button.simple{background:var(--surface);color:var(--fg);border:1px solid var(--line)}
+button.peligro{background:var(--bad-soft);color:var(--bad);border:1px solid var(--bad)}
+button.enlace{background:none;color:var(--muted);font-weight:400;font-size:15px;padding:10px;text-decoration:underline}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+label{display:flex;flex-direction:column;gap:5px;font-size:16px;color:var(--muted)}
+input,select{font:inherit;color:var(--fg);background:var(--surface);border:1px solid var(--line);
+  border-radius:10px;padding:13px 12px;width:100%}
+.pie{margin-top:auto;display:flex;flex-direction:column;gap:6px;text-align:center}
+.fila{display:flex;gap:10px}
+#destello{position:fixed;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;
+  gap:10px;padding:24px;text-align:center;z-index:5;color:#04210f;background:var(--ok)}
+#destello.ver{display:flex}
+#destello.mal{background:var(--bad);color:#2a0704}
+#destello.igual{background:var(--warn);color:#2b1a00}
+#destello b{font-size:40px;line-height:1.1}
+#destello span{font-size:24px}
+@media (prefers-reduced-motion:no-preference){#destello.ver{animation:entra .12s ease-out}
+  @keyframes entra{from{opacity:.4}to{opacity:1}}}
+</style>
+</head>
+<body>
+<main id="pantalla" aria-live="polite"></main>
+<div id="destello" role="alert"></div>
+<script src="logica.js"></script>
+<script>
+'use strict';
+const R = Recorrido;
+const CLAVE = 'recorrido-guardia-v1';
+const REPETIDA_MS = 60000;
+const CONSERVAR_MS = 3 * 24 * 3600 * 1000;
+const ENVIO_CADA_MS = 60000;
+
+const estado = cargar();
+const pantalla = document.getElementById('pantalla');
+const destello = document.getElementById('destello');
+let vista = 'inicio';
+let lector = null;
+let lectorActivo = false;
+let enviando = false;
+let errorEnvio = '';
+let enAlta = null;       // etiqueta recién leída durante el alta
+let etiquetaSinFormato = false;
+let temporizadorDestello = null;
+
+function cargar() {
+  const base = {
+    url: '', token: '', pinHash: '', cfg: { ...R.CONFIG_INICIAL }, puntos: [],
+    marcas: [], altas: [], seq: 0, guardia: '', ultimoEnvio: 0,
+  };
+  try { return { ...base, ...JSON.parse(localStorage.getItem(CLAVE) || '{}') }; } catch { return base; }
+}
+function guardar() { localStorage.setItem(CLAVE, JSON.stringify(estado)); }
+
+async function hashPin(pin) {
+  const datos = new TextEncoder().encode('vbs-recorrido:' + pin);
+  const h = await crypto.subtle.digest('SHA-256', datos);
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function esc(txt) {
+  return String(txt).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// ---------- Lector NFC ----------
+
+const nfcDisponible = () => 'NDEFReader' in window;
+
+async function encenderLector() {
+  if (!nfcDisponible()) return false;
+  if (lectorActivo) return true;
+  try {
+    lector = new NDEFReader();
+    lector.addEventListener('reading', (ev) => alLeer(ev.serialNumber));
+    lector.addEventListener('readingerror', alFallarLectura);
+    await lector.scan();
+    lectorActivo = true;
+    return true;
+  } catch (e) {
+    console.warn('No se pudo activar NFC:', e.name);
+    return false;
+  }
+}
+
+function alFallarLectura() {
+  if (vista === 'alta') {
+    etiquetaSinFormato = true;
+    mostrar();
+  } else {
+    avisar('mal', 'No se pudo leer', 'Volvé a apoyar el celular en la etiqueta');
+  }
+}
+
+function alLeer(uid) {
+  if (!uid) return alFallarLectura();
+  if (vista === 'alta') {
+    enAlta = uid;
+    etiquetaSinFormato = false;
+    return mostrar();
+  }
+  if (vista !== 'inicio') return;
+  const punto = estado.puntos.find((p) => p.uid === uid);
+  if (!punto) return avisar('mal', 'Etiqueta no registrada', 'Avisale al encargado');
+  const ahora = Date.now();
+  const previa = estado.marcas.filter((m) => m.uid === uid).pop();
+  if (previa && ahora - previa.ts < REPETIDA_MS) {
+    return avisar('igual', punto.nombre, 'Ya estaba marcado');
+  }
+  estado.seq += 1;
+  estado.marcas.push({
+    id: `${ahora}-${estado.seq}`, uid, ts: ahora, seq: estado.seq, guardia: estado.guardia, enviada: false,
+  });
+  limpiarViejas(ahora);
+  guardar();
+  if (navigator.vibrate) navigator.vibrate(200);
+  avisar('', punto.nombre, 'Marcado a las ' + R.horaTxt(ahora));
+  mostrar();
+  enviar();
+}
+
+function limpiarViejas(ahora) {
+  estado.marcas = estado.marcas.filter((m) => !m.enviada || ahora - m.ts < CONSERVAR_MS);
+}
+
+function avisar(tipo, titulo, detalle) {
+  destello.className = 'ver ' + tipo;
+  destello.innerHTML = `<b>${esc(titulo)}</b><span>${esc(detalle)}</span>`;
+  if (tipo === 'mal' && navigator.vibrate) navigator.vibrate([120, 80, 120]);
+  clearTimeout(temporizadorDestello);
+  temporizadorDestello = setTimeout(() => { destello.className = ''; }, tipo ? 2500 : 1800);
+}
+
+// ---------- Envío a la planilla ----------
+
+async function enviar() {
+  const pendientes = estado.marcas.filter((m) => !m.enviada);
+  if (enviando || !estado.url || (!pendientes.length && !estado.altas.length)) return;
+  enviando = true;
+  try {
+    const altas = estado.altas.slice();
+    const r = await fetch(estado.url, {
+      method: 'POST',
+      // text/plain: Apps Script no acepta la consulta previa que haría el navegador con JSON.
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({
+        token: estado.token, relojCelular: Date.now(), altas,
+        marcas: pendientes.map(({ id, uid, ts, seq, guardia }) => ({ id, uid, ts, seq, guardia })),
+      }),
+    });
+    const datos = await r.json();
+    if (!datos.ok) throw new Error(datos.error === 'clave' ? 'La clave de la planilla no es correcta' : 'La planilla rechazó el envío');
+    const recibidas = new Set(datos.recibidas);
+    estado.marcas.forEach((m) => { if (recibidas.has(m.id)) m.enviada = true; });
+    estado.altas = estado.altas.filter((a) => !altas.some((b) => b.uid === a.uid));
+    estado.ultimoEnvio = Date.now();
+    errorEnvio = '';
+    guardar();
+    await traerConfig();
+  } catch (e) {
+    // Sin señal es lo normal dentro de las cámaras: las marcas quedan guardadas.
+    errorEnvio = motivoError(e);
+  } finally {
+    enviando = false;
+    mostrar();
+  }
+}
+
+function motivoError(e) {
+  if (e instanceof TypeError) return '';
+  if (e instanceof SyntaxError) return 'La planilla no respondió bien: revisá la dirección';
+  return e.message;
+}
+
+async function traerConfig() {
+  if (!estado.url || estado.altas.length) return;
+  const r = await fetch(`${estado.url}?token=${encodeURIComponent(estado.token)}`);
+  const datos = await r.json();
+  if (!datos.ok) throw new Error('La clave de la planilla no es correcta');
+  estado.cfg = { ...R.CONFIG_INICIAL, ...datos.config };
+  estado.puntos = datos.puntos;
+  guardar();
+}
+
+// ---------- Pantallas ----------
+
+function textoRestante(ms) {
+  const min = Math.ceil(Math.abs(ms) / 60000);
+  const h = Math.floor(min / 60);
+  const resto = min % 60;
+  if (!h) return `${min} min`;
+  return resto ? `${h} h ${resto} min` : `${h} h`;
+}
+
+function vistaPuntos(puntos) {
+  return `<ul>${puntos.map((p) => `<li class="punto${p.ts ? ' hecho' : ''}">
+    <span>${esc(p.nombre)}</span><span>${p.ts ? 'Marcado ' + R.horaTxt(p.ts) : 'Falta'}</span></li>`).join('')}</ul>`;
+}
+
+function vistaEstadoRonda(e, ahora) {
+  if (!e.enTurno) return '<div class="aviso"><strong>Fuera de horario</strong>El turno es de '
+    + `${esc(estado.cfg.inicioTurno)} a ${esc(estado.cfg.finTurno)}.</div>`;
+  const resta = e.venceTs - ahora;
+  if (e.completa) {
+    return `<div class="aviso ok"><strong>Ronda ${e.ronda} terminada</strong>Próxima ronda antes de las ${R.horaTxt(e.venceTs)}.</div>`;
+  }
+  if (resta < 0) {
+    return `<div class="aviso atras"><strong>Ronda ${e.ronda} atrasada</strong>Debía hacerse antes de las ${R.horaTxt(e.venceTs)}.</div>`;
+  }
+  const faltan = e.puntos.filter((p) => !p.ts).length;
+  return `<div class="aviso"><strong>Ronda ${e.ronda}: faltan ${faltan} de ${e.puntos.length}</strong>Quedan ${textoRestante(resta)} (hasta las ${R.horaTxt(e.venceTs)}).</div>`;
+}
+
+function vistaInicio() {
+  if (!estado.url) return vistaPrimerUso();
+  const ahora = Date.now();
+  const e = R.estadoActual(estado.marcas, estado.puntos, estado.cfg, ahora);
+  const sinEnviar = estado.marcas.filter((m) => !m.enviada).length;
+  const pedirNombre = estado.cfg.guardias.length > 0;
+  let cuerpo;
+  if (!nfcDisponible()) {
+    cuerpo = '<div class="aviso atras"><strong>Este navegador no lee etiquetas</strong>Abrí la app con Chrome en un Android con NFC.</div>';
+  } else if (!lectorActivo) {
+    cuerpo = '<button id="activar">Activar lector</button><p class="apagado">Si no responde, revisá que el NFC del celular esté encendido.</p>';
+  } else if (!estado.puntos.length) {
+    cuerpo = '<div class="aviso"><strong>Sin puntos cargados</strong>El encargado tiene que registrar las etiquetas.</div>';
+  } else if (pedirNombre && !estado.guardia) {
+    cuerpo = '<div class="aviso"><strong>Elegí tu nombre para empezar</strong></div>';
+  } else {
+    cuerpo = `${vistaEstadoRonda(e, ahora)}${vistaPuntos(e.puntos)}`;
+  }
+  const opciones = estado.cfg.guardias.map((g) => `<option${g === estado.guardia ? ' selected' : ''}>${esc(g)}</option>`).join('');
+  return `<h1>Recorrido</h1>
+    <p class="apagado">${e.hechas} de ${e.esperadas} rondas hechas esta noche</p>
+    ${pedirNombre ? `<label>Guardia<select id="guardia"><option value="">Elegir</option>${opciones}</select></label>` : ''}
+    ${cuerpo}
+    <div class="pie">
+      <p class="apagado">${sinEnviar ? `Sin enviar: ${sinEnviar}. Se envía al tener señal` : 'Todo enviado'}</p>
+      ${errorEnvio ? `<p class="apagado" style="color:var(--bad)">${esc(errorEnvio)}</p>` : ''}
+      <button class="enlace" id="ir-ajustes">Ajustes</button>
+    </div>`;
+}
+
+function vistaPrimerUso() {
+  return `<h1>Preparar el celular</h1>
+    <p class="apagado">Los datos de la planilla están en el archivo LEEME.</p>
+    <form id="form-inicial" style="display:contents">
+      <label>Dirección de la planilla<input id="url" type="url" required inputmode="url" autocomplete="off" placeholder="https://script.google.com/..."></label>
+      <label>Clave<input id="token" required autocomplete="off"></label>
+      <label>PIN de ajustes (4 números o más)<input id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,}" required autocomplete="new-password"></label>
+      <button>Guardar</button>
+    </form>`;
+}
+
+function vistaPin() {
+  return `<h1>Ajustes</h1>
+    <form id="form-pin" style="display:contents">
+      <label>PIN<input id="pin" type="password" inputmode="numeric" required autofocus autocomplete="current-password"></label>
+      <button>Entrar</button>
+      <button type="button" class="simple" id="volver">Volver</button>
+    </form>`;
+}
+
+function vistaAjustes() {
+  const lista = estado.puntos.map((p) => `<li class="punto"><span>${esc(p.nombre)}</span></li>`).join('');
+  return `<h1>Ajustes</h1>
+    <button id="ir-alta">Registrar etiqueta</button>
+    <button class="simple" id="sincronizar">Actualizar desde la planilla</button>
+    <h2>Puntos del recorrido</h2>
+    <ul>${lista || '<li class="apagado">Todavía no hay puntos.</li>'}</ul>
+    <p class="apagado">Para quitar un punto, poné NO en la columna Activo de la hoja Puntos.</p>
+    <p class="apagado">Turno ${esc(estado.cfg.inicioTurno)} a ${esc(estado.cfg.finTurno)}, una ronda cada ${esc(estado.cfg.intervaloHoras)} h.</p>
+    <div class="pie">
+      <button class="simple" id="volver">Volver</button>
+      <button class="peligro" id="borrar-conexion">Cambiar datos de la planilla</button>
+    </div>`;
+}
+
+function vistaAlta() {
+  if (!lectorActivo) {
+    return '<h1>Registrar etiqueta</h1><button id="activar">Activar lector</button><button class="simple" id="ir-ajustes-ok">Volver</button>';
+  }
+  if (enAlta) {
+    const actual = estado.puntos.find((p) => p.uid === enAlta);
+    return `<h1>Registrar etiqueta</h1>
+      <p class="apagado">Etiqueta ${esc(enAlta)}${actual ? ' (ya registrada)' : ''}</p>
+      <form id="form-alta" style="display:contents">
+        <label>Nombre del punto<input id="nombre" required maxlength="40" value="${esc(actual ? actual.nombre : '')}" autocomplete="off"></label>
+        <button>Guardar punto</button>
+        <button type="button" class="simple" id="cancelar-alta">Cancelar</button>
+      </form>`;
+  }
+  return `<h1>Registrar etiqueta</h1>
+    <div class="aviso"><strong>Apoyá el celular en la etiqueta</strong></div>
+    ${etiquetaSinFormato ? '<p class="apagado">La etiqueta está sin formato.</p><button id="formatear">Preparar etiqueta</button>' : ''}
+    <button class="simple" id="ir-ajustes-ok">Volver</button>`;
+}
+
+function mostrar() {
+  // No redibujar mientras se escribe en un campo: se perdería lo tipeado.
+  const activo = document.activeElement;
+  if (activo && pantalla.contains(activo) && activo.tagName === 'INPUT') return;
+  const vistas = { inicio: vistaInicio, pin: vistaPin, ajustes: vistaAjustes, alta: vistaAlta };
+  pantalla.innerHTML = vistas[vista]();
+  conectar();
+}
+
+function ir(destino) {
+  vista = destino;
+  if (document.activeElement) document.activeElement.blur();
+  mostrar();
+}
+
+function alClic(id, fn) {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('click', fn);
+}
+
+function conectar() {
+  alClic('activar', async () => {
+    if (!(await encenderLector())) avisar('mal', 'No se pudo activar', 'Revisá que el NFC esté encendido y que la página tenga permiso');
+    mostrar();
+  });
+  alClic('ir-ajustes', () => ir('pin'));
+  alClic('volver', () => ir('inicio'));
+  alClic('ir-alta', () => { enAlta = null; etiquetaSinFormato = false; ir('alta'); });
+  alClic('ir-ajustes-ok', () => ir('ajustes'));
+  alClic('cancelar-alta', () => { enAlta = null; ir('alta'); });
+  alClic('sincronizar', async () => {
+    try { await enviar(); await traerConfig(); avisar('', 'Actualizado', 'Datos al día'); }
+    catch { avisar('mal', 'Sin conexión', 'Probá de nuevo con señal'); }
+    mostrar();
+  });
+  alClic('borrar-conexion', () => {
+    if (estado.marcas.some((m) => !m.enviada)) return avisar('mal', 'Hay marcas sin enviar', 'Enviarlas antes de cambiar la planilla');
+    if (!confirm('¿Cambiar la dirección y la clave de la planilla?')) return;
+    estado.url = ''; estado.token = ''; estado.pinHash = '';
+    guardar();
+    ir('inicio');
+  });
+  alClic('formatear', async () => {
+    try {
+      await lector.write({ records: [{ recordType: 'text', data: 'VBS recorrido' }] });
+      etiquetaSinFormato = false;
+      avisar('', 'Etiqueta preparada', 'Volvé a apoyar el celular para registrarla');
+    } catch { avisar('mal', 'No se pudo preparar', 'Mantené el celular quieto sobre la etiqueta'); }
+    mostrar();
+  });
+
+  const guardia = document.getElementById('guardia');
+  if (guardia) guardia.addEventListener('change', () => { estado.guardia = guardia.value; guardar(); mostrar(); });
+
+  const inicial = document.getElementById('form-inicial');
+  if (inicial) inicial.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    estado.url = document.getElementById('url').value.trim();
+    estado.token = document.getElementById('token').value.trim();
+    estado.pinHash = await hashPin(document.getElementById('pin').value);
+    guardar();
+    ir('inicio');
+    try { await traerConfig(); } catch (e) { errorEnvio = motivoError(e); }
+    mostrar();
+  });
+
+  const pin = document.getElementById('form-pin');
+  if (pin) pin.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    if ((await hashPin(document.getElementById('pin').value)) === estado.pinHash) return ir('ajustes');
+    avisar('mal', 'PIN incorrecto', '');
+    document.getElementById('pin').value = '';
+  });
+
+  const alta = document.getElementById('form-alta');
+  if (alta) alta.addEventListener('submit', (ev) => {
+    ev.preventDefault();
+    const nombre = document.getElementById('nombre').value.trim();
+    if (!nombre) return;
+    const punto = estado.puntos.find((p) => p.uid === enAlta);
+    if (punto) punto.nombre = nombre;
+    else estado.puntos.push({ uid: enAlta, nombre, orden: estado.puntos.length + 1 });
+    estado.altas = estado.altas.filter((a) => a.uid !== enAlta).concat({ uid: enAlta, nombre });
+    guardar();
+    avisar('', nombre, 'Punto guardado');
+    enAlta = null;
+    ir('alta');
+    enviar();
+  });
+}
+
+// ---------- Arranque ----------
+
+async function arrancar() {
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+  mostrar();
+  // El permiso ya dado permite activar el lector sin tocar el botón.
+  try {
+    const permiso = await navigator.permissions.query({ name: 'nfc' });
+    if (permiso.state === 'granted') await encenderLector();
+  } catch { /* navegador sin este permiso: queda el botón */ }
+  mostrar();
+  try { await traerConfig(); } catch { /* sin señal se usan los datos guardados */ }
+  mostrar();
+  enviar();
+}
+
+window.addEventListener('online', enviar);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') { enviar(); mostrar(); }
+});
+setInterval(() => { enviar(); if (vista === 'inicio') mostrar(); }, ENVIO_CADA_MS);
+arrancar();
+</script>
+</body>
+</html>
